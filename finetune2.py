@@ -1,4 +1,4 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
 from peft import LoraConfig, get_peft_model
 from datasets import load_dataset
 import torch
@@ -7,20 +7,35 @@ import torch
 dataset = load_dataset("json", data_files="soil_moisture_chat.jsonl", split="train")
 
 # Model and tokenizer
-model_name = "mistralai/Mistral-7B-Instruct-v0.2"
+model_name = "tiiuae/falcon-1b"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    load_in_4bit=True,
-    device_map="auto"
-)
+# 🔧 Fix padding issue
+tokenizer.pad_token = tokenizer.eos_token
 
-# LoRA config
+# Load model with error handling for 4-bit quantization
+try:
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        load_in_4bit=True,
+        device_map="auto"
+    )
+except Exception as e:
+    print(f"4-bit quantization failed: {e}")
+    print("Loading model without quantization...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto"
+    )
+
+# 🔧 Align model config
+model.config.pad_token_id = model.config.eos_token_id
+
+# LoRA config with Falcon-specific target modules
 lora_config = LoraConfig(
     r=8,
     lora_alpha=16,
-    target_modules=["q_proj", "v_proj"],  # common in LLaMA/Mistral
+    target_modules=["query_key_value"],  # Falcon-specific modules
     lora_dropout=0.05,
     bias="none",
     task_type="CAUSAL_LM",
@@ -30,13 +45,36 @@ model = get_peft_model(model, lora_config)
 
 # Preprocess
 def preprocess(example):
-    prompt = f"Instruction: {example['instruction']}\nResponse:"
-    inputs = tokenizer(prompt, truncation=True, padding="max_length", max_length=256)
-    labels = tokenizer(example["response"], truncation=True, padding="max_length", max_length=256)
-    inputs["labels"] = labels["input_ids"]
-    return inputs
+    # Combine instruction and response for causal language modeling
+    full_text = f"Instruction: {example['instruction']}\nResponse: {example['response']}{tokenizer.eos_token}"
+    
+    # Tokenize the full text
+    model_inputs = tokenizer(
+        full_text,
+        truncation=True,
+        padding="max_length",
+        max_length=512,  # Increased length for full instruction + response
+        return_tensors="pt"
+    )
+    
+    # Create labels (shifted for causal LM)
+    labels = model_inputs["input_ids"].clone()
+    
+    # Find the position of "Response:" to mask the instruction part
+    response_start = full_text.find("Response:")
+    if response_start != -1:
+        # Tokenize the instruction part to find its length
+        instruction_part = full_text[:response_start + len("Response:")]
+        instruction_tokens = tokenizer(instruction_part, return_tensors="pt")["input_ids"]
+        instruction_length = instruction_tokens.shape[1]
+        
+        # Mask the instruction part in labels (set to -100)
+        labels[:, :instruction_length] = -100
+    
+    model_inputs["labels"] = labels
+    return model_inputs
 
-tokenized = dataset.map(preprocess, batched=True)
+tokenized = dataset.map(preprocess, batched=True, remove_columns=dataset.column_names)
 
 # Training
 args = TrainingArguments(
@@ -50,9 +88,9 @@ args = TrainingArguments(
     logging_steps=10,
     save_strategy="steps",
     save_steps=50,
+    report_to="none"  # Disable wandb if not configured
 )
 
-from transformers import Trainer
 trainer = Trainer(
     model=model,
     train_dataset=tokenized,
@@ -64,4 +102,3 @@ trainer.train()
 
 # Save adapter
 model.save_pretrained("./soilmoisture-lora")
-    
